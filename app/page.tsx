@@ -39,15 +39,21 @@ import {
   Eye,
   EyeOff,
   AlertTriangle,
+  AlertCircle,
   Check,
   X,
   ShieldCheck,
   RotateCcw,
   LogOut,
+  Phone,
+  RefreshCw,
+  Database,
 } from 'lucide-react';
 import { DistanceGate } from '@/components/distance/DistanceGate';
+import { validateIndianMobile, saveVisionTestResult } from '@/lib/visionTestService';
+import { DatabaseRecordsModal } from '@/components/records/DatabaseRecordsModal';
 
-type Step = 'instructions' | 'distance_gate' | 'game' | 'score_store';
+type Step = 'mobile_number' | 'instructions' | 'distance_gate' | 'game' | 'score_store';
 
 // Standardized 5×5 Tumbling E Optotype dimensions for 1-metre 6/18 visual acuity:
 // Letter height: 4.37 mm, Letter width: 4.37 mm, Stroke thickness: 0.874 mm (15 arcminutes at 1.00 m)
@@ -106,7 +112,42 @@ export default function HomePage() {
       return 'en';
     }
   });
-  const [currentStep, setCurrentStep] = useState<Step>('instructions');
+  const [currentStep, setCurrentStep] = useState<Step>('mobile_number');
+
+  // Step 1: Mobile number validation and session state
+  const [mobileNumber, setMobileNumber] = useState<string>('');
+  const [mobileError, setMobileError] = useState<string | null>(null);
+  const [currentTest, setCurrentTest] = useState<{ mobileNumber: string }>({ mobileNumber: '' });
+
+  // Database save state for vision_test_results
+  const [dbSaveState, setDbSaveState] = useState<{
+    status: 'idle' | 'saving' | 'saved' | 'error';
+    error?: string;
+    savedScore?: string;
+    savedMobile?: string;
+  }>({ status: 'idle' });
+
+  // Prevent duplicate database submissions across re-renders
+  const savedSessionsRef = useRef<Set<string>>(new Set());
+
+  // Database records modal toggle
+  const [isRecordsModalOpen, setIsRecordsModalOpen] = useState<boolean>(false);
+
+  const handleMobileSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const validation = validateIndianMobile(mobileNumber);
+    if (!validation.isValid) {
+      setMobileError(validation.error || 'Please enter a valid 10-digit Indian mobile number');
+      return;
+    }
+    setMobileError(null);
+    const cleanNumber = mobileNumber.trim();
+    setCurrentTest({ mobileNumber: cleanNumber });
+    // Reset database status for the new test session
+    setDbSaveState({ status: 'idle' });
+    // Proceed to existing vision test flow
+    setCurrentStep('instructions');
+  };
 
   const handleLanguageChange = (lang: SupportedLanguage) => {
     setLanguage(lang);
@@ -271,7 +312,38 @@ export default function HomePage() {
     saveScreeningSession(session);
     playChime('celebration');
     setCurrentStep('score_store');
-  }, [optotypeSizeMm, gameResponses, screeningId, calibration]);
+
+    // Automatically save mobile number and final score to vision_test_results database table
+    const finalVisionScore = `${odPassed}/5 , ${osPassed}/5`;
+    if (currentTest.mobileNumber && !savedSessionsRef.current.has(newSessionId)) {
+      savedSessionsRef.current.add(newSessionId);
+      setDbSaveState({
+        status: 'saving',
+        savedMobile: currentTest.mobileNumber,
+        savedScore: finalVisionScore,
+      });
+
+      saveVisionTestResult({
+        mobileNumber: currentTest.mobileNumber,
+        visionScore: finalVisionScore,
+      }).then((res) => {
+        if (res.success) {
+          setDbSaveState({
+            status: 'saved',
+            savedMobile: currentTest.mobileNumber,
+            savedScore: finalVisionScore,
+          });
+        } else {
+          setDbSaveState({
+            status: 'error',
+            error: res.error || 'Failed to save to database',
+            savedMobile: currentTest.mobileNumber,
+            savedScore: finalVisionScore,
+          });
+        }
+      });
+    }
+  }, [optotypeSizeMm, gameResponses, screeningId, calibration, currentTest.mobileNumber]);
 
   // Direction answer handler in Game
   const handleDirectionAnswer = useCallback((answer: OptotypeOrientation) => {
@@ -370,9 +442,38 @@ export default function HomePage() {
     setCurrentOrientation(ORIENTATIONS[Math.floor(Math.random() * ORIENTATIONS.length)]);
   };
 
-  // Screen again / replay
+  // Screen again / replay for next screening session
   const handleScreenAgain = () => {
-    handleStartGame();
+    setDbSaveState({ status: 'idle' });
+    setCurrentStep('mobile_number');
+  };
+
+  const handleRetryDbSave = async () => {
+    if (!currentTest.mobileNumber) return;
+    const currentScore = `${rightTrialsPassed}/5 , ${leftTrialsPassed}/5`;
+    setDbSaveState({
+      status: 'saving',
+      savedMobile: currentTest.mobileNumber,
+      savedScore: currentScore,
+    });
+    const res = await saveVisionTestResult({
+      mobileNumber: currentTest.mobileNumber,
+      visionScore: currentScore,
+    });
+    if (res.success) {
+      setDbSaveState({
+        status: 'saved',
+        savedMobile: currentTest.mobileNumber,
+        savedScore: currentScore,
+      });
+    } else {
+      setDbSaveState({
+        status: 'error',
+        error: res.error || 'Failed to save to database',
+        savedMobile: currentTest.mobileNumber,
+        savedScore: currentScore,
+      });
+    }
   };
 
   // Direction answer trigger with subtle visual highlight feedback and haptic/chime
@@ -511,15 +612,104 @@ export default function HomePage() {
   return (
     <div className="min-h-screen bg-[#FFFDF9] flex flex-col justify-between selection:bg-orange-100 text-slate-900 font-sans">
       {currentStep !== 'game' && (
-        <Header currentLanguage={language} onLanguageChange={handleLanguageChange} />
+        <Header
+          currentLanguage={language}
+          onLanguageChange={handleLanguageChange}
+          onOpenRecords={() => setIsRecordsModalOpen(true)}
+        />
       )}
 
       <main className={currentStep === 'game' ? 'flex-1 w-full flex flex-col items-center justify-center' : 'max-w-4xl mx-auto px-4 sm:px-6 py-6 sm:py-8 flex-1 flex flex-col justify-center w-full'}>
+        {/* ========================================================================= */}
+        {/* STEP 1: MOBILE NUMBER ENTRY (MANDATORY)                                   */}
+        {/* ========================================================================= */}
+        {currentStep === 'mobile_number' && (
+          <div className="w-full max-w-md mx-auto bg-white rounded-[2rem] p-6 sm:p-8 border border-orange-100 shadow-sm text-center" id="step-mobile-number">
+            <div className="w-14 h-14 mx-auto rounded-2xl bg-orange-50 border border-orange-200/90 text-orange-600 flex items-center justify-center mb-4 shadow-xs">
+              <Phone className="w-7 h-7" />
+            </div>
+
+            <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight" id="title-mobile-input">
+              Enter your mobile number
+            </h1>
+            <p className="text-xs sm:text-sm text-slate-600 mt-1.5 font-medium">
+              Please enter your 10-digit mobile number to begin the vision test.
+            </p>
+
+            <form onSubmit={handleMobileSubmit} className="mt-6 text-left">
+              <label htmlFor="input-mobile-number" className="block text-xs font-bold uppercase tracking-wider text-slate-700 mb-2">
+                10-digit Mobile Number <span className="text-orange-600">*</span>
+              </label>
+
+              <div className="relative">
+                <input
+                  type="tel"
+                  id="input-mobile-number"
+                  value={mobileNumber}
+                  onChange={(e) => {
+                    const val = e.target.value.replace(/\D/g, '').slice(0, 10);
+                    setMobileNumber(val);
+                    if (mobileError) setMobileError(null);
+                  }}
+                  placeholder="e.g. 9876543210"
+                  className={`w-full px-4 py-3.5 bg-slate-50 border rounded-2xl text-base sm:text-lg font-mono tracking-wider focus:outline-none transition ${
+                    mobileError
+                      ? 'border-rose-400 focus:ring-2 focus:ring-rose-200 bg-rose-50/30'
+                      : 'border-slate-300 focus:border-orange-500 focus:ring-2 focus:ring-orange-100'
+                  }`}
+                  maxLength={10}
+                  inputMode="numeric"
+                  autoFocus
+                  autoComplete="tel"
+                />
+                <div className="absolute right-3.5 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400">
+                  {mobileNumber.length}/10
+                </div>
+              </div>
+
+              {mobileError && (
+                <p className="mt-2 text-xs font-bold text-rose-600 flex items-center gap-1.5" id="mobile-error-message">
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                  <span>{mobileError}</span>
+                </p>
+              )}
+
+              <button
+                type="submit"
+                className="w-full mt-6 py-4 px-6 bg-orange-600 hover:bg-orange-700 active:scale-[0.99] text-white font-extrabold text-base sm:text-lg rounded-2xl shadow-lg shadow-orange-600/20 flex items-center justify-center gap-2 transition cursor-pointer"
+                id="btn-start-test-mobile"
+              >
+                <span>Start Test</span>
+                <ArrowRight className="w-5 h-5 stroke-[2]" />
+              </button>
+
+              <div className="mt-4 flex items-center justify-center gap-1.5 text-[11px] text-slate-500">
+                <ShieldCheck className="w-3.5 h-3.5 text-orange-600" />
+                <span>Mandatory for test session record • No OTP required</span>
+              </div>
+            </form>
+          </div>
+        )}
+
         {/* ========================================================================= */}
         {/* INSTRUCTIONS                                                              */}
         {/* ========================================================================= */}
         {currentStep === 'instructions' && (
           <div className="w-full max-w-2xl mx-auto bg-white rounded-[2rem] p-5 sm:p-8 border border-orange-100 shadow-sm" id="step-instructions">
+            {currentTest.mobileNumber && (
+              <div className="flex items-center justify-between bg-orange-50/60 border border-orange-200/80 rounded-xl px-3.5 py-2 mb-4 text-xs">
+                <span className="text-slate-700 font-semibold">
+                  Screening session for: <strong className="font-mono text-slate-900">{currentTest.mobileNumber}</strong>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCurrentStep('mobile_number')}
+                  className="text-orange-700 hover:text-orange-900 font-bold underline cursor-pointer"
+                >
+                  Change
+                </button>
+              </div>
+            )}
             <div className="text-center mb-6">
               <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">
                 Vision Screening Instructions
@@ -961,7 +1151,7 @@ export default function HomePage() {
               <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-orange-600 via-amber-500 to-orange-600" />
 
               {/* Header inside scorecard: Official Sankara Eye Foundation, India Logo */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-200 gap-3 mb-6 pt-1">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-200 gap-3 mb-4 pt-1">
                 <div className="flex items-center">
                   <SankaraLogo variant="full" size="lg" />
                 </div>
@@ -972,6 +1162,64 @@ export default function HomePage() {
                   <p className="text-[11px] text-slate-500 font-medium">
                     {new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
                   </p>
+                </div>
+              </div>
+
+              {/* Test Session & Database Record Status */}
+              <div className="p-3.5 rounded-2xl bg-orange-50/50 border border-orange-200/80 mb-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs" id="database-save-status-card">
+                <div>
+                  <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+                    Session & Database Record
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 sm:gap-3 mt-1">
+                    <span className="font-extrabold text-slate-800 text-sm">
+                      Mobile: <span className="font-mono text-slate-900 font-bold">{currentTest.mobileNumber || 'Not recorded'}</span>
+                    </span>
+                    <span className="text-slate-300">•</span>
+                    <span className="font-extrabold text-slate-800 text-sm">
+                      Vision Score: <span className="font-mono text-orange-600 font-black">{rightTrialsPassed}/5 , {leftTrialsPassed}/5</span>
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {dbSaveState.status === 'saving' && (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 font-bold text-xs" id="db-status-saving">
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>Saving to database...</span>
+                    </span>
+                  )}
+                  {dbSaveState.status === 'saved' && (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 font-bold text-xs" id="db-status-saved">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                      <span>Saved to vision_test_results</span>
+                    </span>
+                  )}
+                  {dbSaveState.status === 'error' && (
+                    <div className="flex items-center gap-2" id="db-status-error">
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 font-bold text-xs">
+                        <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
+                        <span>Save failed</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleRetryDbSave}
+                        className="px-2.5 py-1.5 bg-orange-600 hover:bg-orange-700 text-white font-bold rounded-xl text-xs transition cursor-pointer"
+                        id="btn-retry-save-db"
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setIsRecordsModalOpen(true)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-orange-100 hover:bg-orange-200/80 border border-orange-200 text-orange-800 font-bold text-xs transition cursor-pointer shrink-0"
+                    id="btn-view-all-records-scorecard"
+                  >
+                    <Database className="w-3.5 h-3.5 text-orange-600" />
+                    <span>View All Records</span>
+                  </button>
                 </div>
               </div>
 
@@ -1141,7 +1389,10 @@ export default function HomePage() {
             <div className="flex flex-col sm:flex-row items-center gap-3">
               <button
                 type="button"
-                onClick={() => setCurrentStep('instructions')}
+                onClick={() => {
+                  setDbSaveState({ status: 'idle' });
+                  setCurrentStep('mobile_number');
+                }}
                 className="w-full sm:w-auto py-4 px-6 bg-white hover:bg-slate-50 active:bg-slate-100 text-slate-700 border border-slate-200 font-extrabold text-base rounded-2xl shadow-xs flex items-center justify-center gap-2 transition cursor-pointer"
                 id="btn-exit"
               >
@@ -1162,6 +1413,12 @@ export default function HomePage() {
           </div>
         )}
       </main>
+
+      {/* Database Records Modal */}
+      <DatabaseRecordsModal
+        isOpen={isRecordsModalOpen}
+        onClose={() => setIsRecordsModalOpen(false)}
+      />
     </div>
   );
 }

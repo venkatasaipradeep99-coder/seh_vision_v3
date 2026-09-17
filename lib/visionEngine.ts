@@ -42,13 +42,36 @@ export class VisionEngine {
   private currentLuminance: number = 120;
   private isLowLight: boolean = false;
 
-  constructor(private callbacks: VisionEngineCallbacks) {}
+  constructor(private callbacks: VisionEngineCallbacks) {
+    if (typeof document !== 'undefined') {
+      try {
+        this.fallbackCanvas = document.createElement('canvas');
+        this.fallbackCanvas.width = 160;
+        this.fallbackCanvas.height = 120;
+        this.fallbackCtx = this.fallbackCanvas.getContext('2d', { willReadFrequently: true });
+      } catch (e) {
+        console.warn('Fallback canvas initialization warning:', e);
+      }
+    }
+  }
 
   /**
    * Initializes the vision engine with MediaPipe Face Landmarker or native fallbacks
    */
   public async initialize(): Promise<void> {
     this.callbacks.onStatusChange('loading');
+
+    // Ensure fallback canvas is ready immediately
+    if (typeof document !== 'undefined' && (!this.fallbackCanvas || !this.fallbackCtx)) {
+      try {
+        this.fallbackCanvas = document.createElement('canvas');
+        this.fallbackCanvas.width = 160;
+        this.fallbackCanvas.height = 120;
+        this.fallbackCtx = this.fallbackCanvas.getContext('2d', { willReadFrequently: true });
+      } catch (e) {
+        console.warn('Canvas fallback setup warning:', e);
+      }
+    }
 
     // 1. Check for native browser Shape Detection API first (super fast in Chromium)
     if (typeof window !== 'undefined' && 'FaceDetector' in window) {
@@ -66,65 +89,66 @@ export class VisionEngine {
       const vision = await import('@mediapipe/tasks-vision');
       const { FaceLandmarker, FilesetResolver } = vision;
 
-      // Try local /wasm first for fast, reliable offline-ready loading; fallback to CDN
-      let filesetResolver: any;
-      try {
-        filesetResolver = await FilesetResolver.forVisionTasks('/wasm');
-      } catch {
-        filesetResolver = await FilesetResolver.forVisionTasks(
-          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm'
-        );
-      }
-
+      const localWasmPath = '/wasm';
+      const cdnWasmPath = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
       const localModelPath = '/models/face_landmarker.task';
       const cdnModelPath =
         'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 
-      const createLandmarker = async (delegate: 'GPU' | 'CPU', path: string) => {
-        return await FaceLandmarker.createFromOptions(filesetResolver, {
-          baseOptions: {
-            modelAssetPath: path,
-            delegate,
-          },
-          outputFaceBlendshapes: false,
-          runningMode: 'VIDEO',
-          numFaces: 3,
-        });
-      };
-
-      // Try GPU then CPU on local model, falling back to CDN if local model fetch fails
+      // Attempt 1: Local /wasm with local model
       try {
-        this.faceLandmarker = await createLandmarker('GPU', localModelPath);
-      } catch {
+        const localResolver = await FilesetResolver.forVisionTasks(localWasmPath);
         try {
-          this.faceLandmarker = await createLandmarker('CPU', localModelPath);
+          this.faceLandmarker = await FaceLandmarker.createFromOptions(localResolver, {
+            baseOptions: { modelAssetPath: localModelPath, delegate: 'GPU' },
+            outputFaceBlendshapes: false,
+            runningMode: 'VIDEO',
+            numFaces: 3,
+          });
         } catch {
+          this.faceLandmarker = await FaceLandmarker.createFromOptions(localResolver, {
+            baseOptions: { modelAssetPath: localModelPath, delegate: 'CPU' },
+            outputFaceBlendshapes: false,
+            runningMode: 'VIDEO',
+            numFaces: 3,
+          });
+        }
+      } catch (localErr) {
+        console.warn('Local MediaPipe wasm/model attempt skipped:', localErr);
+      }
+
+      // Attempt 2: CDN wasm fallback if local landmarker failed
+      if (!this.faceLandmarker) {
+        try {
+          const cdnResolver = await FilesetResolver.forVisionTasks(cdnWasmPath);
           try {
-            this.faceLandmarker = await createLandmarker('GPU', cdnModelPath);
+            this.faceLandmarker = await FaceLandmarker.createFromOptions(cdnResolver, {
+              baseOptions: { modelAssetPath: localModelPath, delegate: 'GPU' },
+              outputFaceBlendshapes: false,
+              runningMode: 'VIDEO',
+              numFaces: 3,
+            });
           } catch {
-            this.faceLandmarker = await createLandmarker('CPU', cdnModelPath);
+            this.faceLandmarker = await FaceLandmarker.createFromOptions(cdnResolver, {
+              baseOptions: { modelAssetPath: cdnModelPath, delegate: 'CPU' },
+              outputFaceBlendshapes: false,
+              runningMode: 'VIDEO',
+              numFaces: 3,
+            });
           }
+        } catch (cdnErr) {
+          console.warn('CDN MediaPipe initialization attempt failed:', cdnErr);
         }
       }
-      this.callbacks.onStatusChange('active');
-      return;
+
+      if (this.faceLandmarker) {
+        console.log('MediaPipe FaceLandmarker successfully initialized');
+      }
     } catch (err) {
       console.warn('MediaPipe initialization fallback to native/canvas:', err);
     }
 
-    // Fallback: Check if native detector or canvas analyzer is available
-    if (this.nativeFaceDetector) {
-      this.callbacks.onStatusChange('active');
-    } else {
-      // Setup canvas fallback
-      if (typeof document !== 'undefined') {
-        this.fallbackCanvas = document.createElement('canvas');
-        this.fallbackCanvas.width = 160;
-        this.fallbackCanvas.height = 120;
-        this.fallbackCtx = this.fallbackCanvas.getContext('2d', { willReadFrequently: true });
-      }
-      this.callbacks.onStatusChange('active');
-    }
+    this.callbacks.onStatusChange('active');
   }
 
   /**
@@ -132,6 +156,9 @@ export class VisionEngine {
    */
   public start(video: HTMLVideoElement): void {
     this.videoElement = video;
+    if (this.isProcessing && this.animFrameId !== null) {
+      return;
+    }
     this.isProcessing = true;
     this.isDestroyed = false;
     this.loop();
@@ -217,36 +244,49 @@ export class VisionEngine {
         this.lastMediaPipeTimestamp = mpTimestamp;
         const result = this.faceLandmarker.detectForVideo(this.videoElement, mpTimestamp);
 
-        if (!result || !result.faceLandmarks || result.faceLandmarks.length === 0) {
-          this.callbacks.onMeasurement({
-            timestamp: Date.now(),
-            faceCount: 0,
-            confidence: 0,
-            videoWidth: this.videoElement.videoWidth,
-            videoHeight: this.videoElement.videoHeight,
-            luminance,
-            isLowLight,
-          });
+        if (result && result.faceLandmarks && result.faceLandmarks.length > 0) {
+          const faceCount = result.faceLandmarks.length;
+          if (faceCount > 1) {
+            this.callbacks.onMeasurement({
+              timestamp: Date.now(),
+              faceCount,
+              confidence: 0.9,
+              videoWidth: this.videoElement.videoWidth,
+              videoHeight: this.videoElement.videoHeight,
+              luminance,
+              isLowLight,
+            });
+            return;
+          }
+
+          const landmarks = result.faceLandmarks[0];
+          const measurement = this.extractMeasurementFromLandmarks(landmarks, luminance, isLowLight);
+          this.callbacks.onMeasurement(measurement);
           return;
         }
 
-        const faceCount = result.faceLandmarks.length;
-        if (faceCount > 1) {
-          this.callbacks.onMeasurement({
-            timestamp: Date.now(),
-            faceCount,
-            confidence: 0.9,
-            videoWidth: this.videoElement.videoWidth,
-            videoHeight: this.videoElement.videoHeight,
-            luminance,
-            isLowLight,
-          });
-          return;
+        // If MediaPipe returned 0 landmarks on this frame, check fallback canvas before giving up
+        if (this.fallbackCtx && this.fallbackCanvas) {
+          const fallbackMeasurement = this.processFallbackCanvasFrame();
+          if (fallbackMeasurement.faceCount > 0) {
+            fallbackMeasurement.luminance = luminance;
+            fallbackMeasurement.isLowLight = isLowLight;
+            fallbackMeasurement.videoWidth = this.videoElement.videoWidth;
+            fallbackMeasurement.videoHeight = this.videoElement.videoHeight;
+            this.callbacks.onMeasurement(fallbackMeasurement);
+            return;
+          }
         }
 
-        const landmarks = result.faceLandmarks[0];
-        const measurement = this.extractMeasurementFromLandmarks(landmarks, luminance, isLowLight);
-        this.callbacks.onMeasurement(measurement);
+        this.callbacks.onMeasurement({
+          timestamp: Date.now(),
+          faceCount: 0,
+          confidence: 0,
+          videoWidth: this.videoElement.videoWidth,
+          videoHeight: this.videoElement.videoHeight,
+          luminance,
+          isLowLight,
+        });
         return;
       }
 
@@ -575,8 +615,16 @@ export class VisionEngine {
         const g = data[idx + 1];
         const b = data[idx + 2];
 
-        // Standard normalized RGB/YCbCr skin-tone filter
-        if (r > 60 && g > 40 && b > 20 && r > g && r > b && (r - Math.min(g, b)) > 15) {
+        // Multi-ethnic inclusive human skin-tone detection (Fitzpatrick I-VI)
+        // Check 1: RGB relative distribution
+        const isRgbSkin = r > 45 && g > 25 && b > 15 && r > g && (r - b) > 10;
+        // Check 2: YCbCr color-space skin region
+        const yVal = 0.299 * r + 0.587 * g + 0.114 * b;
+        const cbVal = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+        const crVal = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+        const isYCbCrSkin = yVal > 25 && cbVal >= 75 && cbVal <= 140 && crVal >= 125 && crVal <= 185;
+
+        if (isRgbSkin || isYCbCrSkin) {
           skinPixelCount++;
           sumX += x;
           sumY += y;
@@ -591,8 +639,8 @@ export class VisionEngine {
     const totalSampled = (cW * cH) / 4;
     const skinRatio = skinPixelCount / totalSampled;
 
-    // A human face at ~1m typically occupies 6% to 22% of total frame pixels
-    if (skinRatio < 0.03 || skinPixelCount < 50) {
+    // A human face at ~1m typically occupies 2% to 30% of total frame pixels
+    if (skinRatio < 0.015 || skinPixelCount < 25) {
       return { timestamp: Date.now(), faceCount: 0, confidence: 0 };
     }
 

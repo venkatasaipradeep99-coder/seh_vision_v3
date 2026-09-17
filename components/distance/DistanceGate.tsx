@@ -361,14 +361,26 @@ export const DistanceGate: React.FC<DistanceGateProps> = ({
     });
 
     visionEngineRef.current = engine;
-    engine.initialize().then(() => {
+
+    // Start camera immediately on mount asynchronously
+    const cameraTimer = setTimeout(() => {
       startCamera('user');
+    }, 0);
+
+    // Initialize vision engine in parallel; attach to video as soon as ready
+    engine.initialize().then(() => {
+      if (videoRef.current && videoRef.current.srcObject) {
+        engine.start(videoRef.current);
+      }
     }).catch((err) => {
       console.info('Vision engine fallback initialization:', err);
-      startCamera('user');
+      if (videoRef.current && videoRef.current.srcObject) {
+        engine.start(videoRef.current);
+      }
     });
 
     return () => {
+      clearTimeout(cameraTimer);
       stopCameraStream();
       engine.destroy();
       visionEngineRef.current = null;

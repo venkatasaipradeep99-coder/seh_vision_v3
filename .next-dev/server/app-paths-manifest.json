@@ -1,3 +1,5 @@
 {
-  "/page": "app/page.js"
+  "/api/vision-test-results/route": "app/api/vision-test-results/route.js",
+  "/page": "app/page.js",
+  "/records/page": "app/records/page.js"
 }
